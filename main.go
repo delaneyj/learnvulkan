@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"runtime"
+	"sort"
 	"strings"
 	"unsafe"
 
@@ -101,7 +102,7 @@ func (app *HelloTriangleApplication) initVulkan() error {
 		return errors.Wrap(err, "can't create vk instance")
 	}
 
-	if err := app.pickPhysicalDevice(); err != nil {
+	if _, err := app.pickPhysicalDevice(); err != nil {
 		return errors.Wrap(err, "can't pick physical device")
 	}
 
@@ -277,33 +278,75 @@ func debugCallback(flags vk.DebugReportFlags, objectType vk.DebugReportObjectTyp
 	return vk.Bool32(vk.False)
 }
 
-func (app *HelloTriangleApplication) pickPhysicalDevice() error {
-	var physicalDevice vk.PhysicalDevice
+func (app *HelloTriangleApplication) pickPhysicalDevice() (physicalDevice vk.PhysicalDevice, err error) {
 
 	var deviceCount uint32
-	if err := vk.Error(vk.EnumeratePhysicalDevices(app.instance, &deviceCount, nil)); err != nil {
-		return errors.Wrap(err, "can't get physical device count")
+	if err = vk.Error(vk.EnumeratePhysicalDevices(app.instance, &deviceCount, nil)); err != nil {
+		err = errors.Wrap(err, "can't get physical device count")
+		return
 	}
 
 	devices := make([]vk.PhysicalDevice, deviceCount)
-	if err := vk.Error(vk.EnumeratePhysicalDevices(app.instance, &deviceCount, devices)); err != nil {
-		return errors.Wrap(err, "can't get physical device count")
+	if err = vk.Error(vk.EnumeratePhysicalDevices(app.instance, &deviceCount, devices)); err != nil {
+		err = errors.Wrap(err, "can't get physical device count")
+		return
 	}
 
-	isDeviceSuitable := func(d vk.PhysicalDevice) bool {
-		return true
+	if len(devices) == 0 {
+		err = errors.New("no phyical device detected")
+		return
 	}
 
-	for _, d := range devices {
-		if isDeviceSuitable(d) {
-			physicalDevice = d
-			break
+	type deviceScore struct {
+		Device vk.PhysicalDevice
+		Name   string
+		Score  uint32
+	}
+	candidates := make([]deviceScore, len(devices))
+
+	for i, d := range devices {
+		var score uint32
+
+		// Discrete GPUs have a significant performance advantage
+		var properties vk.PhysicalDeviceProperties
+		vk.GetPhysicalDeviceProperties(d, &properties)
+		properties.Deref()
+		if isDiscrete := properties.DeviceType == vk.PhysicalDeviceTypeDiscreteGpu; isDiscrete {
+			score += 1000
+		}
+
+		var features vk.PhysicalDeviceFeatures
+		vk.GetPhysicalDeviceFeatures(d, &features)
+		features.Deref()
+
+		// Maximum possible size of textures affects graphics quality
+		score += properties.Limits.MaxImageDimension2D
+
+		// Application can't function without geometry shaders
+		if hasGeometryShader := features.GeometryShader.B(); hasGeometryShader {
+			score = 0
+		}
+
+		candidates[i] = deviceScore{
+			Device: d,
+			Name:   vk.ToString(properties.DeviceName[:]),
+			Score:  score,
 		}
 	}
 
+	sort.Slice(candidates, func(i, j int) bool {
+		a, b := candidates[i], candidates[j]
+		return a.Score > b.Score
+	})
+
+	chosen := candidates[0]
+	physicalDevice = chosen.Device
+
 	if physicalDevice == nil {
-		return errors.New("failed to find suitable GPU")
+		err = errors.New("failed to find suitable GPU")
+		return
 	}
 
-	return nil
+	log.Printf("Selecting physical device '%s'", chosen.Name)
+	return
 }
