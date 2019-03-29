@@ -45,9 +45,11 @@ func main() {
 }
 
 type HelloTriangleApplication struct {
-	window   *glfw.Window
-	instance vk.Instance
-	debug    vk.DebugReportCallback
+	window         *glfw.Window
+	instance       vk.Instance
+	debug          vk.DebugReportCallback
+	physicalDevice vk.PhysicalDevice
+	device         vk.Device
 }
 
 func (app *HelloTriangleApplication) Run() error {
@@ -102,8 +104,13 @@ func (app *HelloTriangleApplication) initVulkan() error {
 		return errors.Wrap(err, "can't create vk instance")
 	}
 
-	if _, err := app.pickPhysicalDevice(); err != nil {
+	graphicsQueueFamilyIndex, err := app.pickPhysicalDevice()
+	if err != nil {
 		return errors.Wrap(err, "can't pick physical device")
+	}
+
+	if err := app.createLogicalDevice(graphicsQueueFamilyIndex); err != nil {
+		return errors.Wrap(err, "can't create logical device")
 	}
 
 	return nil
@@ -124,6 +131,10 @@ func (app *HelloTriangleApplication) mainLoop() error {
 }
 
 func (app *HelloTriangleApplication) cleanup() {
+	if app.device != nil {
+		vk.DestroyDevice(app.device, nil)
+	}
+
 	if enableValidationLayers && app.debug != nil && app.debug != vk.NullDebugReportCallback {
 		vk.DestroyDebugReportCallback(app.instance, app.debug, nil)
 	}
@@ -268,33 +279,33 @@ func debugCallback(flags vk.DebugReportFlags, objectType vk.DebugReportObjectTyp
 	pMessage string, pUserData unsafe.Pointer) vk.Bool32 {
 
 	switch {
+	case flags&vk.DebugReportFlags(vk.DebugReportInformationBit) != 0:
+		log.Printf("[INFO %d] %s on layer %s", messageCode, pMessage, pLayerPrefix)
 	case flags&vk.DebugReportFlags(vk.DebugReportErrorBit) != 0:
 		log.Printf("[ERROR %d] %s on layer %s", messageCode, pMessage, pLayerPrefix)
 	case flags&vk.DebugReportFlags(vk.DebugReportWarningBit) != 0:
 		log.Printf("[WARN %d] %s on layer %s", messageCode, pMessage, pLayerPrefix)
 	default:
-		log.Printf("[WARN] unknown debug message %d (layer %s)", messageCode, pLayerPrefix)
+		log.Printf("[WARN] unknown debug message <%d> %d (layer %s) %s", flags, messageCode, pLayerPrefix, pMessage)
 	}
 	return vk.Bool32(vk.False)
 }
 
-func (app *HelloTriangleApplication) pickPhysicalDevice() (physicalDevice vk.PhysicalDevice, err error) {
+func (app *HelloTriangleApplication) pickPhysicalDevice() (uint32, error) {
+	var physicalDevice vk.PhysicalDevice
 
 	var deviceCount uint32
-	if err = vk.Error(vk.EnumeratePhysicalDevices(app.instance, &deviceCount, nil)); err != nil {
-		err = errors.Wrap(err, "can't get physical device count")
-		return
+	if err := vk.Error(vk.EnumeratePhysicalDevices(app.instance, &deviceCount, nil)); err != nil {
+		return 0, errors.Wrap(err, "can't get physical device count")
 	}
 
 	devices := make([]vk.PhysicalDevice, deviceCount)
-	if err = vk.Error(vk.EnumeratePhysicalDevices(app.instance, &deviceCount, devices)); err != nil {
-		err = errors.Wrap(err, "can't get physical device count")
-		return
+	if err := vk.Error(vk.EnumeratePhysicalDevices(app.instance, &deviceCount, devices)); err != nil {
+		return 0, errors.Wrap(err, "can't get physical device count")
 	}
 
 	if len(devices) == 0 {
-		err = errors.New("no phyical device detected")
-		return
+		return 0, errors.New("no phyical device detected")
 	}
 
 	type deviceScore struct {
@@ -343,10 +354,70 @@ func (app *HelloTriangleApplication) pickPhysicalDevice() (physicalDevice vk.Phy
 	physicalDevice = chosen.Device
 
 	if physicalDevice == nil {
-		err = errors.New("failed to find suitable GPU")
-		return
+		return 0, errors.New("failed to find suitable GPU")
 	}
 
+	//findQueueFamilyIndices
+	graphicsQueueFamilyIndex := -1
+	{
+		var propertyCount uint32
+		vk.GetPhysicalDeviceQueueFamilyProperties(physicalDevice, &propertyCount, nil)
+		families := make([]vk.QueueFamilyProperties, propertyCount)
+		vk.GetPhysicalDeviceQueueFamilyProperties(physicalDevice, &propertyCount, families)
+
+		for i, qf := range families {
+			qf.Deref()
+			if qf.QueueCount > 0 && qf.QueueFlags&vk.QueueFlags(vk.QueueGraphicsBit) != 0 {
+				graphicsQueueFamilyIndex = i
+				break
+			}
+		}
+
+		if graphicsQueueFamilyIndex < 0 {
+			return 0, errors.New("Physical does not have needed queue famalies avaiable.")
+		}
+	}
+
+	app.physicalDevice = chosen.Device
 	log.Printf("Selecting physical device '%s'", chosen.Name)
-	return
+
+	return uint32(graphicsQueueFamilyIndex), nil
+}
+
+func (app *HelloTriangleApplication) createLogicalDevice(graphicsQueueFamilyIndex uint32) error {
+	queueCreateInfo := vk.DeviceQueueCreateInfo{
+		SType:            vk.StructureTypeDeviceQueueCreateInfo,
+		QueueFamilyIndex: graphicsQueueFamilyIndex,
+		QueueCount:       1,
+		PQueuePriorities: []float32{1},
+	}
+
+	deviceFeatues := []vk.PhysicalDeviceFeatures{}
+
+	deviceCreateInfo := &vk.DeviceCreateInfo{
+		SType:                 vk.StructureTypeDeviceCreateInfo,
+		PQueueCreateInfos:     []vk.DeviceQueueCreateInfo{queueCreateInfo},
+		QueueCreateInfoCount:  1,
+		PEnabledFeatures:      deviceFeatues,
+		EnabledExtensionCount: 0,
+	}
+
+	if enableValidationLayers {
+		deviceCreateInfo.EnabledLayerCount = uint32(len(validationLayerNames))
+		deviceCreateInfo.PpEnabledLayerNames = validationLayerNames
+	}
+
+	var device vk.Device
+	if err := vk.Error(vk.CreateDevice(app.physicalDevice, deviceCreateInfo, nil, &device)); err != nil {
+		return errors.Wrap(err, "can't create logical device")
+	}
+	app.device = device
+
+	var graphicsQueue vk.Queue
+	vk.GetDeviceQueue(app.device, graphicsQueueFamilyIndex, 0, &graphicsQueue)
+	if graphicsQueue == nil {
+		return errors.New("can't get graphics queue")
+	}
+
+	return nil
 }
